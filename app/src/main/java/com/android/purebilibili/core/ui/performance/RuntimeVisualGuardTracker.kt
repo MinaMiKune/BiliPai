@@ -44,6 +44,21 @@ internal class RuntimeVisualGuardTracker(
      */
     private var activeSession: Any? = null
 
+    /**
+     * 当前帧序号。[onFrame] 每帧自增一次，窗口记录最后一次被累加的帧号，
+     * 「本帧未出现」就用帧号比较，不再为每帧构造 key 集合。
+     */
+    private var frameStamp = 0L
+
+    /** 收窗 key 的复用缓冲：steady-state 帧不再为 filter/map 分配列表。 */
+    private val closingKeys = ArrayList<String>(4)
+
+    /**
+     * 窗口结算才可能改变决策。steady-state 帧（只累加、无窗口结算）因此不需要
+     * 重算决策、也不写 `_decision`，避免每帧一次 StateFlow 赋值与决策对象分配。
+     */
+    private var decisionDirty = false
+
     private class SignalWindow {
         var activeValue: String? = null
         var frameCount = 0
@@ -53,6 +68,9 @@ internal class RuntimeVisualGuardTracker(
         var downgraded = false
         var forceLowBlurBudget = false
         var lastTouchedAtMs = 0L
+
+        /** 最近一次被 [accumulate] 命中的帧号，用于判定窗口是否在本帧仍处于活动状态。 */
+        var frameStamp = 0L
 
         val hasOpenWindow: Boolean get() = activeValue != null
     }
@@ -72,6 +90,8 @@ internal class RuntimeVisualGuardTracker(
         enabled = value
         if (!value) {
             signals.clear()
+            closingKeys.clear()
+            decisionDirty = false
             _decision.value = normalDecision()
         } else {
             publish(nowMs = null)
@@ -129,21 +149,37 @@ internal class RuntimeVisualGuardTracker(
 
     fun onFrame(frameData: FrameData, nowMs: Long) {
         if (!enabled) return
-        val tracked = frameData.states.asSequence()
-            .filter { isRuntimeVisualGuardTrackedStateKey(it.key) }
-            .associate { it.key to it.value }
-
-        // 本帧仍在活跃的信号累加；本帧消失但窗口还开着的信号收窗结算。
-        tracked.forEach { (key, value) ->
-            accumulate(key = key, stateValue = value, isJank = frameData.isJank, nowMs = nowMs)
+        val stamp = ++frameStamp
+        // 索引循环替代 sequence/filter/associate：主线程每帧调用，不能按帧分配 Map。
+        val states = frameData.states
+        for (index in states.indices) {
+            val state = states[index]
+            if (!isRuntimeVisualGuardTrackedStateKey(state.key)) continue
+            accumulate(
+                key = state.key,
+                stateValue = state.value,
+                isJank = frameData.isJank,
+                nowMs = nowMs,
+                stamp = stamp,
+            )
         }
-        signals.entries
-            .filter { (key, window) -> window.hasOpenWindow && key !in tracked }
-            .map { it.key }
-            .forEach { key -> finishWindow(key, nowMs) }
 
-        evictStaleSignals()
-        publish(nowMs)
+        // 本帧未出现的活跃信号收窗结算；先收集 key 再结算，避免遍历期间改动 map。
+        if (signals.isNotEmpty()) {
+            for ((key, window) in signals) {
+                if (window.hasOpenWindow && window.frameStamp != stamp) closingKeys.add(key)
+            }
+            if (closingKeys.isNotEmpty()) {
+                for (index in closingKeys.indices) finishWindow(closingKeys[index], nowMs)
+                closingKeys.clear()
+            }
+        }
+
+        if (evictStaleSignals()) decisionDirty = true
+        if (decisionDirty) {
+            decisionDirty = false
+            publish(nowMs)
+        }
     }
 
     /** 测试入口：单信号简写，语义等价于卡片转场打点。 */
@@ -158,13 +194,23 @@ internal class RuntimeVisualGuardTracker(
     /** 测试入口：单信号简写，语义等价于卡片转场打点。 */
     internal fun onFrame(stateValue: String?, isJank: Boolean, nowMs: Long) {
         if (!enabled) return
+        val stamp = ++frameStamp
         val key = VIDEO_CARD_TRANSITION_JANK_STATE
         if (stateValue.isNullOrBlank()) {
             if (signals[key]?.hasOpenWindow == true) finishWindow(key, nowMs)
         } else {
-            accumulate(key = key, stateValue = stateValue, isJank = isJank, nowMs = nowMs)
+            accumulate(
+                key = key,
+                stateValue = stateValue,
+                isJank = isJank,
+                nowMs = nowMs,
+                stamp = stamp,
+            )
         }
-        publish(nowMs)
+        if (decisionDirty) {
+            decisionDirty = false
+            publish(nowMs)
+        }
     }
 
     fun discardActiveWindow() {
@@ -181,17 +227,23 @@ internal class RuntimeVisualGuardTracker(
         activeSession = null
     }
 
-    private fun accumulate(key: String, stateValue: String, isJank: Boolean, nowMs: Long) {
+    private fun accumulate(
+        key: String,
+        stateValue: String,
+        isJank: Boolean,
+        nowMs: Long,
+        stamp: Long,
+    ) {
         val window = signals.getOrPut(key) { SignalWindow() }
         // 同一信号内 state 值切换（Opening → Returning）也算一个窗口结束。
         if (window.activeValue != null && window.activeValue != stateValue) {
             finishWindow(key, nowMs)
         }
-        val refreshed = signals.getOrPut(key) { SignalWindow() }
-        refreshed.activeValue = stateValue
-        refreshed.frameCount += 1
-        if (isJank) refreshed.jankyFrameCount += 1
-        refreshed.lastTouchedAtMs = nowMs
+        window.activeValue = stateValue
+        window.frameCount += 1
+        if (isJank) window.jankyFrameCount += 1
+        window.lastTouchedAtMs = nowMs
+        window.frameStamp = stamp
     }
 
     private fun finishWindow(key: String, nowMs: Long) {
@@ -202,6 +254,8 @@ internal class RuntimeVisualGuardTracker(
         window.frameCount = 0
         window.jankyFrameCount = 0
         window.lastTouchedAtMs = nowMs
+        // 任何一次结算都可能改变决策（自身降级，或为其它信号提供恢复证据）。
+        decisionDirty = true
         if (frameCount < minimumFrameCount) return
 
         val jankPercent = jankyFrameCount * 100f / frameCount
@@ -273,17 +327,20 @@ internal class RuntimeVisualGuardTracker(
     }
 
     /** 只淘汰没有开着窗口、且最久未更新的信号，避免误删正在统计的交互。 */
-    private fun evictStaleSignals() {
-        if (signals.size <= RUNTIME_VISUAL_GUARD_MAX_TRACKED_SIGNALS) return
+    private fun evictStaleSignals(): Boolean {
+        if (signals.size <= RUNTIME_VISUAL_GUARD_MAX_TRACKED_SIGNALS) return false
         val evictable = signals.entries
             .filter { !it.value.hasOpenWindow && !it.value.downgraded }
             .sortedBy { it.value.lastTouchedAtMs }
         var overflow = signals.size - RUNTIME_VISUAL_GUARD_MAX_TRACKED_SIGNALS
+        var evicted = false
         for (entry in evictable) {
             if (overflow <= 0) break
             signals.remove(entry.key)
             overflow -= 1
+            evicted = true
         }
+        return evicted
     }
 
     private fun publish(nowMs: Long?) {
