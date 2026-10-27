@@ -368,3 +368,4 @@ internal class RuntimeVisualGuardTracker(
 }
 
 internal val AppRuntimeVisualGuardTracker = RuntimeVisualGuardTracker()
+
